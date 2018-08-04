@@ -18,6 +18,7 @@ from collections import OrderedDict
 from collections import Iterable
 from .utils.generic_utils import Progbar
 from . import backend as K
+from .engine.training_utils import standardize_input_data
 
 try:
     import requests
@@ -202,7 +203,19 @@ class BaseLogger(Callback):
     """Callback that accumulates epoch averages of metrics.
 
     This callback is automatically applied to every Keras model.
+
+    # Arguments
+        stateful_metrics: Iterable of string names of metrics that
+            should *not* be averaged over an epoch.
+            Metrics in this list will be logged as-is in `on_epoch_end`.
+            All others will be averaged in `on_epoch_end`.
     """
+
+    def __init__(self, stateful_metrics=None):
+        if stateful_metrics:
+            self.stateful_metrics = set(stateful_metrics)
+        else:
+            self.stateful_metrics = set()
 
     def on_epoch_begin(self, epoch, logs=None):
         self.seen = 0
@@ -214,25 +227,28 @@ class BaseLogger(Callback):
         self.seen += batch_size
 
         for k, v in logs.items():
-            if k in self.totals:
-                self.totals[k] += v * batch_size
+            if k in self.stateful_metrics:
+                self.totals[k] = v
             else:
-                self.totals[k] = v * batch_size
+                if k in self.totals:
+                    self.totals[k] += v * batch_size
+                else:
+                    self.totals[k] = v * batch_size
 
     def on_epoch_end(self, epoch, logs=None):
         if logs is not None:
             for k in self.params['metrics']:
                 if k in self.totals:
                     # Make value available to next callbacks.
-                    logs[k] = self.totals[k] / self.seen
+                    if k in self.stateful_metrics:
+                        logs[k] = self.totals[k]
+                    else:
+                        logs[k] = self.totals[k] / self.seen
 
 
 class TerminateOnNaN(Callback):
     """Callback that terminates training when a NaN loss is encountered.
     """
-
-    def __init__(self):
-        super(TerminateOnNaN, self).__init__()
 
     def on_batch_end(self, batch, logs=None):
         logs = logs or {}
@@ -250,12 +266,17 @@ class ProgbarLogger(Callback):
         count_mode: One of "steps" or "samples".
             Whether the progress bar should
             count samples seen or steps (batches) seen.
+        stateful_metrics: Iterable of string names of metrics that
+            should *not* be averaged over an epoch.
+            Metrics in this list will be logged as-is.
+            All others will be averaged over time (e.g. loss, etc).
 
     # Raises
         ValueError: In case of invalid `count_mode`.
     """
 
-    def __init__(self, count_mode='samples'):
+    def __init__(self, count_mode='samples',
+                 stateful_metrics=None):
         super(ProgbarLogger, self).__init__()
         if count_mode == 'samples':
             self.use_steps = False
@@ -263,6 +284,10 @@ class ProgbarLogger(Callback):
             self.use_steps = True
         else:
             raise ValueError('Unknown `count_mode`: ' + str(count_mode))
+        if stateful_metrics:
+            self.stateful_metrics = set(stateful_metrics)
+        else:
+            self.stateful_metrics = set()
 
     def on_train_begin(self, logs=None):
         self.verbose = self.params['verbose']
@@ -277,7 +302,8 @@ class ProgbarLogger(Callback):
                 target = self.params['samples']
             self.target = target
             self.progbar = Progbar(target=self.target,
-                                   verbose=self.verbose)
+                                   verbose=self.verbose,
+                                   stateful_metrics=self.stateful_metrics)
         self.seen = 0
 
     def on_batch_begin(self, batch, logs=None):
@@ -307,7 +333,7 @@ class ProgbarLogger(Callback):
             if k in logs:
                 self.log_values.append((k, logs[k]))
         if self.verbose:
-            self.progbar.update(self.seen, self.log_values, force=True)
+            self.progbar.update(self.seen, self.log_values)
 
 
 class History(Callback):
@@ -418,8 +444,8 @@ class ModelCheckpoint(Callback):
                             self.model.save(filepath, overwrite=True)
                     else:
                         if self.verbose > 0:
-                            print('\nEpoch %05d: %s did not improve' %
-                                  (epoch + 1, self.monitor))
+                            print('\nEpoch %05d: %s did not improve from %0.5f' %
+                                  (epoch + 1, self.monitor, self.best))
             else:
                 if self.verbose > 0:
                     print('\nEpoch %05d: saving model to %s' % (epoch + 1, filepath))
@@ -448,13 +474,22 @@ class EarlyStopping(Callback):
             monitored has stopped increasing; in `auto`
             mode, the direction is automatically inferred
             from the name of the monitored quantity.
+        baseline: Baseline value for the monitored quantity to reach.
+            Training will stop if the model doesn't show improvement
+            over the baseline.
     """
 
-    def __init__(self, monitor='val_loss',
-                 min_delta=0, patience=0, verbose=0, mode='auto'):
+    def __init__(self,
+                 monitor='val_loss',
+                 min_delta=0,
+                 patience=0,
+                 verbose=0,
+                 mode='auto',
+                 baseline=None):
         super(EarlyStopping, self).__init__()
 
         self.monitor = monitor
+        self.baseline = baseline
         self.patience = patience
         self.verbose = verbose
         self.min_delta = min_delta
@@ -486,7 +521,10 @@ class EarlyStopping(Callback):
         # Allow instances to be re-used
         self.wait = 0
         self.stopped_epoch = 0
-        self.best = np.Inf if self.monitor_op == np.less else -np.Inf
+        if self.baseline is not None:
+            self.best = self.baseline
+        else:
+            self.best = np.Inf if self.monitor_op == np.less else -np.Inf
 
     def on_epoch_end(self, epoch, logs=None):
         current = logs.get(self.monitor)
@@ -518,25 +556,31 @@ class RemoteMonitor(Callback):
     Events are sent to `root + '/publish/epoch/end/'` by default. Calls are
     HTTP POST, with a `data` argument which is a
     JSON-encoded dictionary of event data.
+    If send_as_json is set to True, the content type of the request will be application/json.
+    Otherwise the serialized JSON will be send within a form
 
     # Arguments
         root: String; root url of the target server.
         path: String; path relative to `root` to which the events will be sent.
-        field: String; JSON field under which the data will be stored.
+        field: String; JSON field under which the data will be stored. The field is used only if the payload is sent
+        within a form (i.e. send_as_json is set to False).
         headers: Dictionary; optional custom HTTP headers.
+        send_as_json: Boolean; whether the request should be send as application/json.
     """
 
     def __init__(self,
                  root='http://localhost:9000',
                  path='/publish/epoch/end/',
                  field='data',
-                 headers=None):
+                 headers=None,
+                 send_as_json=False):
         super(RemoteMonitor, self).__init__()
 
         self.root = root
         self.path = path
         self.field = field
         self.headers = headers
+        self.send_as_json = send_as_json
 
     def on_epoch_end(self, epoch, logs=None):
         if requests is None:
@@ -546,11 +590,17 @@ class RemoteMonitor(Callback):
         send = {}
         send['epoch'] = epoch
         for k, v in logs.items():
-            send[k] = v
+            if isinstance(v, (np.ndarray, np.generic)):
+                send[k] = v.item()
+            else:
+                send[k] = v
         try:
-            requests.post(self.root + self.path,
-                          {self.field: json.dumps(send)},
-                          headers=self.headers)
+            if self.send_as_json:
+                requests.post(self.root + self.path, json=send, headers=self.headers)
+            else:
+                requests.post(self.root + self.path,
+                              {self.field: json.dumps(send)},
+                              headers=self.headers)
         except requests.exceptions.RequestException:
             warnings.warn('Warning: could not reach RemoteMonitor '
                           'root server at ' + str(self.root))
@@ -561,8 +611,8 @@ class LearningRateScheduler(Callback):
 
     # Arguments
         schedule: a function that takes an epoch index as input
-            (integer, indexed from 0) and returns a new
-            learning rate as output (float).
+            (integer, indexed from 0) and current learning rate
+            and returns a new learning rate as output (float).
         verbose: int. 0: quiet, 1: update messages.
     """
 
@@ -574,13 +624,17 @@ class LearningRateScheduler(Callback):
     def on_epoch_begin(self, epoch, logs=None):
         if not hasattr(self.model.optimizer, 'lr'):
             raise ValueError('Optimizer must have a "lr" attribute.')
-        lr = self.schedule(epoch)
+        lr = float(K.get_value(self.model.optimizer.lr))
+        try:  # new API
+            lr = self.schedule(epoch, lr)
+        except TypeError:  # old API for backward compatibility
+            lr = self.schedule(epoch)
         if not isinstance(lr, (float, np.float32, np.float64)):
             raise ValueError('The output of the "schedule" function '
                              'should be float.')
         K.set_value(self.model.optimizer.lr, lr)
         if self.verbose > 0:
-            print('\nEpoch %05d: LearningRateScheduler reducing learning '
+            print('\nEpoch %05d: LearningRateScheduler setting learning '
                   'rate to %s.' % (epoch + 1, lr))
 
 
@@ -622,7 +676,9 @@ class TensorBoard(Callback):
         write_images: whether to write model weights to visualize as
             image in TensorBoard.
         embeddings_freq: frequency (in epochs) at which selected embedding
-            layers will be saved.
+            layers will be saved. If set to 0, embeddings won't be computed.
+            Data to be visualized in TensorBoard's Embedding tab must be passed
+            as `embeddings_data`.
         embeddings_layer_names: a list of names of layers to keep eye on. If
             None or empty list all the embedding layer will be watched.
         embeddings_metadata: a dictionary which maps layer name to a file name
@@ -630,6 +686,10 @@ class TensorBoard(Callback):
             [details](https://www.tensorflow.org/how_tos/embedding_viz/#metadata_optional)
             about metadata files format. In case if the same metadata file is
             used for all embedding layers, string can be passed.
+        embeddings_data: data to be embedded at layers specified in
+            `embeddings_layer_names`. Numpy array (if the model has a single
+            input) or list of Numpy arrays (if the model has multiple inputs).
+            Learn [more about embeddings](https://www.tensorflow.org/programmers_guide/embedding)
     """
 
     def __init__(self, log_dir='./logs',
@@ -640,7 +700,8 @@ class TensorBoard(Callback):
                  write_images=False,
                  embeddings_freq=0,
                  embeddings_layer_names=None,
-                 embeddings_metadata=None):
+                 embeddings_metadata=None,
+                 embeddings_data=None):
         super(TensorBoard, self).__init__()
         global tf, projector
         try:
@@ -677,6 +738,7 @@ class TensorBoard(Callback):
         self.embeddings_layer_names = embeddings_layer_names
         self.embeddings_metadata = embeddings_metadata or {}
         self.batch_size = batch_size
+        self.embeddings_data = embeddings_data
 
     def set_model(self, model):
         self.model = model
@@ -733,8 +795,12 @@ class TensorBoard(Callback):
                         tf.summary.image(mapped_weight_name, w_img)
 
                 if hasattr(layer, 'output'):
-                    tf.summary.histogram('{}_out'.format(layer.name),
-                                         layer.output)
+                    if isinstance(layer.output, list):
+                        for i, output in enumerate(layer.output):
+                            tf.summary.histogram('{}_out_{}'.format(layer.name, i), output)
+                    else:
+                        tf.summary.histogram('{}_out'.format(layer.name),
+                                             layer.output)
         self.merged = tf.summary.merge_all()
 
         if self.write_graph:
@@ -743,18 +809,35 @@ class TensorBoard(Callback):
         else:
             self.writer = tf.summary.FileWriter(self.log_dir)
 
-        if self.embeddings_freq:
+        if self.embeddings_freq and self.embeddings_data is not None:
+            self.embeddings_data = standardize_input_data(self.embeddings_data, model.input_names)
+
             embeddings_layer_names = self.embeddings_layer_names
 
             if not embeddings_layer_names:
                 embeddings_layer_names = [layer.name for layer in self.model.layers
                                           if type(layer).__name__ == 'Embedding']
+            self.assign_embeddings = []
+            embeddings_vars = {}
 
-            embeddings = {layer.name: layer.weights[0]
-                          for layer in self.model.layers
-                          if layer.name in embeddings_layer_names}
+            self.batch_id = batch_id = tf.placeholder(tf.int32)
+            self.step = step = tf.placeholder(tf.int32)
 
-            self.saver = tf.train.Saver(list(embeddings.values()))
+            for layer in self.model.layers:
+                if layer.name in embeddings_layer_names:
+                    embedding_input = self.model.get_layer(layer.name).output
+                    embedding_size = np.prod(embedding_input.shape[1:])
+                    embedding_input = tf.reshape(embedding_input,
+                                                 (step, int(embedding_size)))
+                    shape = (self.embeddings_data[0].shape[0], int(embedding_size))
+                    embedding = tf.Variable(tf.zeros(shape),
+                                            name=layer.name + '_embedding')
+                    embeddings_vars[layer.name] = embedding
+                    batch = tf.assign(embedding[batch_id:batch_id + step],
+                                      embedding_input)
+                    self.assign_embeddings.append(batch)
+
+            self.saver = tf.train.Saver(list(embeddings_vars.values()))
 
             embeddings_metadata = {}
 
@@ -762,13 +845,11 @@ class TensorBoard(Callback):
                 embeddings_metadata = self.embeddings_metadata
             else:
                 embeddings_metadata = {layer_name: self.embeddings_metadata
-                                       for layer_name in embeddings.keys()}
+                                       for layer_name in embeddings_vars.keys()}
 
             config = projector.ProjectorConfig()
-            self.embeddings_ckpt_path = os.path.join(self.log_dir,
-                                                     'keras_embedding.ckpt')
 
-            for layer_name, tensor in embeddings.items():
+            for layer_name, tensor in embeddings_vars.items():
                 embedding = config.embeddings.add()
                 embedding.tensor_name = tensor.name
 
@@ -781,8 +862,11 @@ class TensorBoard(Callback):
         logs = logs or {}
 
         if not self.validation_data and self.histogram_freq:
-            raise ValueError('If printing histograms, validation_data must be '
-                             'provided, and cannot be a generator.')
+            raise ValueError("If printing histograms, validation_data must be "
+                             "provided, and cannot be a generator.")
+        if self.embeddings_data is None and self.embeddings_freq:
+            raise ValueError("To visualize embeddings, embeddings_data must "
+                             "be provided.")
         if self.validation_data and self.histogram_freq:
             if epoch % self.histogram_freq == 0:
 
@@ -812,11 +896,43 @@ class TensorBoard(Callback):
                     self.writer.add_summary(summary_str, epoch)
                     i += self.batch_size
 
-        if self.embeddings_freq and self.embeddings_ckpt_path:
+        if self.embeddings_freq and self.embeddings_data is not None:
             if epoch % self.embeddings_freq == 0:
-                self.saver.save(self.sess,
-                                self.embeddings_ckpt_path,
-                                epoch)
+                # We need a second forward-pass here because we're passing
+                # the `embeddings_data` explicitly. This design allows to pass
+                # arbitrary data as `embeddings_data` and results from the fact
+                # that we need to know the size of the `tf.Variable`s which
+                # hold the embeddings in `set_model`. At this point, however,
+                # the `validation_data` is not yet set.
+
+                # More details in this discussion:
+                # https://github.com/keras-team/keras/pull/7766#issuecomment-329195622
+
+                embeddings_data = self.embeddings_data
+                n_samples = embeddings_data[0].shape[0]
+
+                i = 0
+                while i < n_samples:
+                    step = min(self.batch_size, n_samples - i)
+                    batch = slice(i, i + step)
+
+                    if type(self.model.input) == list:
+                        feed_dict = {model_input: embeddings_data[idx][batch]
+                                     for idx, model_input in enumerate(self.model.input)}
+                    else:
+                        feed_dict = {self.model.input: embeddings_data[0][batch]}
+
+                    feed_dict.update({self.batch_id: i, self.step: step})
+
+                    if self.model.uses_learning_phase:
+                        feed_dict[K.learning_phase()] = False
+
+                    self.sess.run(self.assign_embeddings, feed_dict=feed_dict)
+                    self.saver.save(self.sess,
+                                    os.path.join(self.log_dir, 'keras_embedding.ckpt'),
+                                    epoch)
+
+                    i += self.batch_size
 
         for name, value in logs.items():
             if name in ['batch', 'size']:
@@ -862,7 +978,7 @@ class ReduceLROnPlateau(Callback):
             monitored has stopped increasing; in `auto`
             mode, the direction is automatically inferred
             from the name of the monitored quantity.
-        epsilon: threshold for measuring the new optimum,
+        min_delta: threshold for measuring the new optimum,
             to only focus on significant changes.
         cooldown: number of epochs to wait before resuming
             normal operation after lr has been reduced.
@@ -870,16 +986,21 @@ class ReduceLROnPlateau(Callback):
     """
 
     def __init__(self, monitor='val_loss', factor=0.1, patience=10,
-                 verbose=0, mode='auto', epsilon=1e-4, cooldown=0, min_lr=0):
+                 verbose=0, mode='auto', min_delta=1e-4, cooldown=0, min_lr=0,
+                 **kwargs):
         super(ReduceLROnPlateau, self).__init__()
 
         self.monitor = monitor
         if factor >= 1.0:
             raise ValueError('ReduceLROnPlateau '
                              'does not support a factor >= 1.0.')
+        if 'epsilon' in kwargs:
+            min_delta = kwargs.pop('epsilon')
+            warnings.warn('`epsilon` argument is deprecated and '
+                          'will be removed, use `min_delta` instead.')
         self.factor = factor
         self.min_lr = min_lr
-        self.epsilon = epsilon
+        self.min_delta = min_delta
         self.patience = patience
         self.verbose = verbose
         self.cooldown = cooldown
@@ -900,10 +1021,10 @@ class ReduceLROnPlateau(Callback):
             self.mode = 'auto'
         if (self.mode == 'min' or
            (self.mode == 'auto' and 'acc' not in self.monitor)):
-            self.monitor_op = lambda a, b: np.less(a, b - self.epsilon)
+            self.monitor_op = lambda a, b: np.less(a, b - self.min_delta)
             self.best = np.Inf
         else:
-            self.monitor_op = lambda a, b: np.greater(a, b + self.epsilon)
+            self.monitor_op = lambda a, b: np.greater(a, b + self.min_delta)
             self.best = -np.Inf
         self.cooldown_counter = 0
         self.wait = 0
@@ -931,6 +1052,7 @@ class ReduceLROnPlateau(Callback):
                 self.best = current
                 self.wait = 0
             elif not self.in_cooldown():
+                self.wait += 1
                 if self.wait >= self.patience:
                     old_lr = float(K.get_value(self.model.optimizer.lr))
                     if old_lr > self.min_lr:
@@ -942,7 +1064,6 @@ class ReduceLROnPlateau(Callback):
                                   'rate to %s.' % (epoch + 1, new_lr))
                         self.cooldown_counter = self.cooldown
                         self.wait = 0
-                self.wait += 1
 
     def in_cooldown(self):
         return self.cooldown_counter > 0

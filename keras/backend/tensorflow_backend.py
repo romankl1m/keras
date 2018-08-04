@@ -3,21 +3,23 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
+from tensorflow.python.framework import ops as tf_ops
 from tensorflow.python.training import moving_averages
 from tensorflow.python.ops import tensor_array_ops
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import functional_ops
 from tensorflow.python.ops import ctc_ops as ctc
-from tensorflow.python.ops import variables as tf_variables
 from tensorflow.python.client import device_lib
+from tensorflow.core.protobuf import config_pb2
 
 from collections import defaultdict
 
 import numpy as np
 import os
 
-from .common import floatx, epsilon
-from .common import image_data_format
+from .common import floatx
+from .common import epsilon
+from .common import normalize_data_format
 from ..utils.generic_utils import has_arg
 
 # Legacy functions
@@ -25,7 +27,9 @@ from .common import set_image_dim_ordering
 from .common import image_dim_ordering
 
 py_all = all
+py_any = any
 py_sum = sum
+py_slice = slice
 
 # INTERNAL UTILS
 
@@ -73,7 +77,8 @@ def get_uid(prefix=''):
 
 
 def reset_uids():
-    """Reset graph identifiers."""
+    """Resets graph identifiers.
+    """
     global _GRAPH_UID_DICTS
     _GRAPH_UID_DICTS = {}
 
@@ -163,8 +168,11 @@ def get_session():
         A TensorFlow session.
     """
     global _SESSION
-    if tf.get_default_session() is not None:
-        session = tf.get_default_session()
+
+    default_session = tf.get_default_session()
+
+    if default_session is not None:
+        session = default_session
     else:
         if _SESSION is None:
             if not os.environ.get('OMP_NUM_THREADS'):
@@ -252,7 +260,7 @@ def _is_current_explicit_device(device_type):
     """
     device_type = device_type.upper()
     if device_type not in ['CPU', 'GPU']:
-        raise ValueError('device_type should be either "CPU" or "GPU".')
+        raise ValueError('`device_type` should be either "CPU" or "GPU".')
     device = _get_current_tf_device()
     return (device is not None and device.device_type == device_type.upper())
 
@@ -459,12 +467,15 @@ def is_keras_tensor(x):
         True
     ```
     """
-    if not isinstance(x, (tf.Tensor,
-                          tf_variables.Variable,
-                          tf.SparseTensor)):
-        raise ValueError('Unexpectedly found an instance of type `' + str(type(x)) + '`. '
+    if not is_tensor(x):
+        raise ValueError('Unexpectedly found an instance of type `' +
+                         str(type(x)) + '`. '
                          'Expected a symbolic tensor instance.')
     return hasattr(x, '_keras_history')
+
+
+def is_tensor(x):
+    return isinstance(x, tf_ops._TensorLike) or tf_ops.is_dense_tensor_like(x)
 
 
 def placeholder(shape=None, ndim=None, dtype=None, sparse=False, name=None):
@@ -1128,6 +1139,13 @@ def batch_dot(x, y, axes=None):
         axes = (axes, axes)
     x_ndim = ndim(x)
     y_ndim = ndim(y)
+    if axes is None:
+        # behaves like tf.batch_matmul as default
+        axes = [x_ndim - 1, y_ndim - 2]
+    if py_any([isinstance(a, (list, tuple)) for a in axes]):
+        raise ValueError('Multiple target dimensions are not supported. ' +
+                         'Expected: None, int, (int, int), ' +
+                         'Provided: ' + str(axes))
     if x_ndim > y_ndim:
         diff = x_ndim - y_ndim
         y = tf.reshape(y, tf.concat([tf.shape(y), [1] * (diff)], axis=0))
@@ -1205,7 +1223,7 @@ def gather(reference, indices):
     # Returns
         A tensor of same type as `reference`.
     """
-    return tf.gather(reference, indices)
+    return tf.nn.embedding_lookup(reference, indices)
 
 
 # ELEMENT-WISE OPERATIONS
@@ -1833,11 +1851,11 @@ def normalize_batch_in_training(x, gamma, beta,
                                                           epsilon=epsilon)
 
 
-def batch_normalization(x, mean, var, beta, gamma, epsilon=1e-3):
+def batch_normalization(x, mean, var, beta, gamma, axis=-1, epsilon=1e-3):
     """Applies batch normalization on x given mean, var, beta and gamma.
 
     I.e. returns:
-    `output = (x - mean) / (sqrt(var) + epsilon) * gamma + beta`
+    `output = (x - mean) / sqrt(var + epsilon) * gamma + beta`
 
     # Arguments
         x: Input tensor or variable.
@@ -1845,11 +1863,49 @@ def batch_normalization(x, mean, var, beta, gamma, epsilon=1e-3):
         var: Variance of batch.
         beta: Tensor with which to center the input.
         gamma: Tensor by which to scale the input.
+        axis: Integer, the axis that should be normalized.
+            (typically the features axis).
         epsilon: Fuzz factor.
 
     # Returns
         A tensor.
     """
+    if ndim(x) == 4:
+        # The CPU implementation of FusedBatchNorm only support NHWC
+        if axis == 1 or axis == -3:
+            tf_data_format = 'NCHW'
+        elif axis == 3 or axis == -1:
+            tf_data_format = 'NHWC'
+        else:
+            tf_data_format = None
+
+        if tf_data_format == 'NHWC' or tf_data_format == 'NCHW' and _has_nchw_support():
+            # The mean / var / beta / gamma may be processed by broadcast
+            # so it may have extra axes with 1, it is not needed and should be removed
+            if ndim(mean) > 1:
+                mean = tf.squeeze(mean)
+            if ndim(var) > 1:
+                var = tf.squeeze(var)
+            if beta is None:
+                beta = zeros_like(mean)
+            elif ndim(beta) > 1:
+                beta = tf.squeeze(beta)
+            if gamma is None:
+                gamma = ones_like(mean)
+            elif ndim(gamma) > 1:
+                gamma = tf.squeeze(gamma)
+            y, _, _ = tf.nn.fused_batch_norm(
+                x,
+                gamma,
+                beta,
+                epsilon=epsilon,
+                mean=mean,
+                variance=var,
+                data_format=tf_data_format,
+                is_training=False
+            )
+            return y
+    # default
     return tf.nn.batch_normalization(x, mean, var, beta, gamma, epsilon)
 
 
@@ -2046,7 +2102,7 @@ def arange(start, stop=None, step=1, dtype='int32'):
 
     The function arguments use the same convention as
     Theano's arange: if only one argument is provided,
-    it is in fact the "stop" argument.
+    it is in fact the "stop" argument and "start" is 0.
 
     The default type of the returned tensor is `'int32'` to
     match TensorFlow's default.
@@ -2061,7 +2117,7 @@ def arange(start, stop=None, step=1, dtype='int32'):
         An integer tensor.
 
     """
-    # Match the behavior of numpy and Theano by returning an empty seqence.
+    # Match the behavior of numpy and Theano by returning an empty sequence.
     if stop is None:
         try:
             if start < 0:
@@ -2180,10 +2236,7 @@ def spatial_2d_padding(x, padding=((1, 1), (1, 1)), data_format=None):
     assert len(padding) == 2
     assert len(padding[0]) == 2
     assert len(padding[1]) == 2
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     if data_format == 'channels_first':
         pattern = [[0, 0],
@@ -2224,10 +2277,7 @@ def spatial_3d_padding(x, padding=((1, 1), (1, 1), (1, 1)), data_format=None):
     assert len(padding[0]) == 2
     assert len(padding[1]) == 2
     assert len(padding[2]) == 2
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     if data_format == 'channels_first':
         pattern = [
@@ -2277,7 +2327,7 @@ def one_hot(indices, num_classes):
 
 
 def reverse(x, axes):
-    """Reverse a tensor along the specified axes.
+    """Reverses a tensor along the specified axes.
 
     # Arguments
         x: Tensor to reverse.
@@ -2290,6 +2340,26 @@ def reverse(x, axes):
     if isinstance(axes, int):
         axes = [axes]
     return tf.reverse(x, axes)
+
+
+def slice(x, start, size):
+    """Extracts a slice from a tensor.
+
+    # Arguments
+        x: Input tensor.
+        start: Integer list/tuple or tensor
+            indicating the start indices of the slice
+            along each axis.
+        size: Integer list/tuple or tensor
+            indicating how many dimensions to slice
+            along each axis.
+
+    # Returns
+        Tensor `x[start[0]: start[0] + size[0],
+                  ...,
+                  start[-1]: start[-1] + size[-1]]`
+    """
+    return tf.slice(x, start, size)
 
 
 # VALUE MANIPULATION
@@ -2422,11 +2492,15 @@ class Function(object):
         outputs: Output tensors to fetch.
         updates: Additional update ops to be run at function call.
         name: a name to help users identify what this function does.
-        session_kwargs: arguments to `tf.Session.run()`: `fetches`, `feed_dict`,
-        `options`, `run_metadata`
+        session_kwargs: arguments to `tf.Session.run()`:
+            `fetches`, `feed_dict`,
+            `options`, `run_metadata`
     """
 
-    def __init__(self, inputs, outputs, updates=None, name=None, **session_kwargs):
+    def __init__(self, inputs, outputs,
+                 updates=None,
+                 name=None,
+                 **session_kwargs):
         updates = updates or []
         if not isinstance(inputs, (list, tuple)):
             raise TypeError('`inputs` to a TensorFlow backend function '
@@ -2456,17 +2530,122 @@ class Function(object):
         self.fetches = session_kwargs.pop('fetches', [])
         if not isinstance(self.fetches, list):
             self.fetches = [self.fetches]
+        # The main use case of `fetches` being passed to a model is the ability
+        # to run custom updates
+        # (since the outputs of fetches are never returned).
+        # This requires us to wrap fetches in `identity` ops.
+        self.fetches = [tf.identity(x) for x in self.fetches]
         self.session_kwargs = session_kwargs
+        if session_kwargs:
+            raise ValueError('Some keys in session_kwargs are not '
+                             'supported at this '
+                             'time: %s', session_kwargs.keys())
+        self._callable_fn = None
+        self._feed_arrays = None
+        self._feed_symbols = None
+        self._symbol_vals = None
+        self._session = None
 
-    def __call__(self, inputs):
+    def _make_callable(self, feed_arrays, feed_symbols, symbol_vals, session):
+        """Generates a callable that runs the graph.
+
+        # Arguments
+            feed_arrays: List of input tensors to be fed
+                Numpy arrays at runtime.
+            feed_symbols: List of input tensors to be fed
+                symbolic tensors at runtime.
+            symbol_vals: List of symbolic tensors to be fed to `feed_symbols`.
+            session: Session to use to generate the callable.
+
+        # Returns
+            Function that runs the graph according to the above options.
+        """
+        # Prepare callable options.
+        callable_opts = config_pb2.CallableOptions()
+        # Handle external-data feed.
+        for x in feed_arrays:
+            callable_opts.feed.append(x.name)
+        if self.feed_dict:
+            for key in sorted(self.feed_dict.keys()):
+                callable_opts.feed.append(key.name)
+        # Handle symbolic feed.
+        for x, y in zip(feed_symbols, symbol_vals):
+            connection = callable_opts.tensor_connection.add()
+            if x.dtype != y.dtype:
+                y = tf.cast(y, dtype=x.dtype)
+            from_tensor = tf_ops._as_graph_element(y)
+            if from_tensor is None:
+                from_tensor = y
+            connection.from_tensor = from_tensor.name  # Data tensor
+            connection.to_tensor = x.name  # Placeholder
+        # Handle fetches.
+        for x in self.outputs + self.fetches:
+            callable_opts.fetch.append(x.name)
+        # Handle updates.
+        callable_opts.target.append(self.updates_op.name)
+        # Create callable.
+        callable_fn = session._make_callable_from_options(callable_opts)
+        # Cache parameters corresponding to the generated callable, so that
+        # we can detect future mismatches and refresh the callable.
+        self._callable_fn = callable_fn
+        self._feed_arrays = feed_arrays
+        self._feed_symbols = feed_symbols
+        self._symbol_vals = symbol_vals
+        self._session = session
+
+    def _call(self, inputs):
+        if not isinstance(inputs, (list, tuple)):
+            raise TypeError('`inputs` should be a list or tuple.')
+
+        session = get_session()
+        feed_arrays = []
+        array_vals = []
+        feed_symbols = []
+        symbol_vals = []
+        for tensor, value in zip(self.inputs, inputs):
+            if value is None:
+                continue
+            if is_tensor(value):
+                # Case: feeding symbolic tensor.
+                feed_symbols.append(tensor)
+                symbol_vals.append(value)
+            else:
+                feed_arrays.append(tensor)
+                # We need to do array conversion and type casting
+                # at this level, since
+                # `callable_fn` only supports exact matches.
+                array_vals.append(
+                    np.asarray(value,
+                               dtype=tf.as_dtype(tensor.dtype).as_numpy_dtype))
+        if self.feed_dict:
+            for key in sorted(self.feed_dict.keys()):
+                array_vals.append(
+                    np.asarray(self.feed_dict[key],
+                               dtype=tf.as_dtype(key.dtype).as_numpy_dtype))
+
+        # Refresh callable if anything has changed.
+        if (self._callable_fn is None or
+                feed_arrays != self._feed_arrays or
+                symbol_vals != self._symbol_vals or
+                feed_symbols != self._feed_symbols or
+                session != self._session):
+            self._make_callable(feed_arrays,
+                                feed_symbols,
+                                symbol_vals,
+                                session)
+        fetched = self._callable_fn(*array_vals)
+        return fetched[:len(self.outputs)]
+
+    def _legacy_call(self, inputs):
         if not isinstance(inputs, (list, tuple)):
             raise TypeError('`inputs` should be a list or tuple.')
         feed_dict = self.feed_dict.copy()
         for tensor, value in zip(self.inputs, inputs):
             if is_sparse(tensor):
                 sparse_coo = value.tocoo()
-                indices = np.concatenate((np.expand_dims(sparse_coo.row, 1),
-                                          np.expand_dims(sparse_coo.col, 1)), 1)
+                indices = np.concatenate(
+                    (np.expand_dims(sparse_coo.row, 1),
+                     np.expand_dims(sparse_coo.col, 1)), 1)
                 value = (indices, sparse_coo.data, sparse_coo.shape)
             feed_dict[tensor] = value
         fetches = self.outputs + [self.updates_op] + self.fetches
@@ -2474,6 +2653,23 @@ class Function(object):
         updated = session.run(fetches=fetches, feed_dict=feed_dict,
                               **self.session_kwargs)
         return updated[:len(self.outputs)]
+
+    def __call__(self, inputs):
+        if hasattr(get_session(), '_make_callable_from_options'):
+            if py_any(is_sparse(x) for x in self.inputs):
+                if py_any(is_tensor(x) for x in inputs):
+                    raise ValueError(
+                        'Feeding from symbolic tensors is not '
+                        'supported with sparse inputs.')
+                return self._legacy_call(inputs)
+
+            return self._call(inputs)
+        else:
+            if py_any(is_tensor(x) for x in inputs):
+                raise ValueError(
+                    'In order to feed symbolic tensors to a Keras model '
+                    'in TensorFlow, you need tensorflow 1.8 or higher.')
+            return self._legacy_call(inputs)
 
 
 def function(inputs, outputs, updates=None, **kwargs):
@@ -2500,7 +2696,7 @@ def function(inputs, outputs, updates=None, **kwargs):
 
 
 def gradients(loss, variables):
-    """Returns the gradients of `variables` w.r.t. `loss`.
+    """Returns the gradients of `loss` w.r.t. `variables`.
 
     # Arguments
         loss: Scalar tensor to minimize.
@@ -2537,48 +2733,46 @@ def rnn(step_function, inputs, initial_states,
     """Iterates over the time dimension of a tensor.
 
     # Arguments
-        step_function: RNN step function.
+        step_function:
             Parameters:
-                inputs: tensor with shape `(samples, ...)` (no time dimension),
+                inputs: Tensor with shape (samples, ...) (no time dimension),
                     representing input for the batch of samples at a certain
                     time step.
-                states: list of tensors.
+                states: List of tensors.
             Returns:
-                outputs: tensor with shape `(samples, output_dim)`
-                    (no time dimension).
-                new_states: list of tensors, same length and shapes
-                    as 'states'. The first state in the list must be the
-                    output tensor at the previous timestep.
-        inputs: tensor of temporal data of shape `(samples, time, ...)`
+                outputs: Tensor with shape (samples, ...) (no time dimension),
+                new_states: List of tensors, same length and shapes
+                    as 'states'.
+        inputs: Tensor of temporal data of shape (samples, time, ...)
             (at least 3D).
-        initial_states: tensor with shape (samples, output_dim)
-            (no time dimension),
+        initial_states: Tensor with shape (samples, ...) (no time dimension),
             containing the initial values for the states used in
             the step function.
-        go_backwards: boolean. If True, do the iteration over the time
+        go_backwards: Boolean. If True, do the iteration over the time
             dimension in reverse order and return the reversed sequence.
-        mask: binary tensor with shape `(samples, time, 1)`,
+        mask: Binary tensor with shape (samples, time),
             with a zero for every element that is masked.
-        constants: a list of constant values passed at each step.
-        unroll: whether to unroll the RNN or to use a symbolic loop (`while_loop` or `scan` depending on backend).
-        input_length: not relevant in the TensorFlow implementation.
-            Must be specified if using unrolling with Theano.
+        constants: A list of constant values passed at each step.
+        unroll: Whether to unroll the RNN or to use a symbolic loop
+            (`while_loop` or `scan` depending on backend).
+        input_length: Static number of timesteps in the input.
 
     # Returns
         A tuple, `(last_output, outputs, new_states)`.
 
-            last_output: the latest output of the rnn, of shape `(samples, ...)`
-            outputs: tensor with shape `(samples, time, ...)` where each
-                entry `outputs[s, t]` is the output of the step function
-                at time `t` for sample `s`.
-            new_states: list of tensors, latest states returned by
-                the step function, of shape `(samples, ...)`.
+        last_output: The latest output of the rnn, of shape `(samples, ...)`
+        outputs: Tensor with shape `(samples, time, ...)` where each
+            entry `outputs[s, t]` is the output of the step function
+            at time `t` for sample `s`.
+        new_states: List of tensors, latest states returned by
+            the step function, of shape `(samples, ...)`.
 
     # Raises
-        ValueError: if input dimension is less than 3.
-        ValueError: if `unroll` is `True` but input timestep is not a fixed number.
-        ValueError: if `mask` is provided (not `None`) but states is not provided
-            (`len(states)` == 0).
+        ValueError: If input dimension is less than 3.
+        ValueError: If `unroll` is `True`
+            but input timestep is not a fixed number.
+        ValueError: If `mask` is provided (not `None`)
+            but states is not provided (`len(states)` == 0).
     """
     ndim = len(inputs.get_shape())
     if ndim < 3:
@@ -2729,7 +2923,10 @@ def rnn(step_function, inputs, initial_states,
                 tiled_mask_t = tf.tile(mask_t,
                                        tf.stack([1, tf.shape(output)[1]]))
                 output = tf.where(tiled_mask_t, output, states[0])
-                new_states = [tf.where(tiled_mask_t, new_states[i], states[i]) for i in range(len(states))]
+                new_states = [
+                    tf.where(tf.tile(mask_t, tf.stack([1, tf.shape(new_states[i])[1]])),
+                             new_states[i], states[i]) for i in range(len(states))
+                ]
                 output_ta_t = output_ta_t.write(time, output)
                 return (time + 1, output_ta_t) + tuple(new_states)
         else:
@@ -2761,7 +2958,8 @@ def rnn(step_function, inputs, initial_states,
             body=_step,
             loop_vars=(time, output_ta) + states,
             parallel_iterations=32,
-            swap_memory=True)
+            swap_memory=True,
+            maximum_iterations=input_length)
         last_time = final_outputs[0]
         output_ta = final_outputs[1]
         new_states = final_outputs[2:]
@@ -2942,16 +3140,18 @@ def elu(x, alpha=1.):
         return tf.where(x > 0, res, alpha * res)
 
 
-def softmax(x):
+def softmax(x, axis=-1):
     """Softmax of a tensor.
 
     # Arguments
         x: A tensor or variable.
+        axis: The dimension softmax would be performed on.
+            The default is -1 which indicates the last dimension.
 
     # Returns
         A tensor.
     """
-    return tf.nn.softmax(x)
+    return tf.nn.softmax(x, axis=axis)
 
 
 def softplus(x):
@@ -2978,7 +3178,7 @@ def softsign(x):
     return tf.nn.softsign(x)
 
 
-def categorical_crossentropy(target, output, from_logits=False):
+def categorical_crossentropy(target, output, from_logits=False, axis=-1):
     """Categorical crossentropy between an output tensor and a target tensor.
 
     # Arguments
@@ -2988,28 +3188,40 @@ def categorical_crossentropy(target, output, from_logits=False):
             case `output` is expected to be the logits).
         from_logits: Boolean, whether `output` is the
             result of a softmax, or is a tensor of logits.
+        axis: Int specifying the channels axis. `axis=-1`
+            corresponds to data format `channels_last`,
+            and `axis=1` corresponds to data format
+            `channels_first`.
 
     # Returns
         Output tensor.
+
+    # Raises
+        ValueError: if `axis` is neither -1 nor one of
+            the axes of `output`.
     """
+    output_dimensions = list(range(len(output.get_shape())))
+    if axis != -1 and axis not in output_dimensions:
+        raise ValueError(
+            '{}{}{}'.format(
+                'Unexpected channels axis {}. '.format(axis),
+                'Expected to be -1 or one of the axes of `output`, ',
+                'which has {} dimensions.'.format(len(output.get_shape()))))
     # Note: tf.nn.softmax_cross_entropy_with_logits
     # expects logits, Keras expects probabilities.
     if not from_logits:
         # scale preds so that the class probas of each sample sum to 1
-        output /= tf.reduce_sum(output,
-                                len(output.get_shape()) - 1,
-                                True)
+        output /= tf.reduce_sum(output, axis, True)
         # manual computation of crossentropy
         _epsilon = _to_tensor(epsilon(), output.dtype.base_dtype)
         output = tf.clip_by_value(output, _epsilon, 1. - _epsilon)
-        return - tf.reduce_sum(target * tf.log(output),
-                               len(output.get_shape()) - 1)
+        return - tf.reduce_sum(target * tf.log(output), axis)
     else:
         return tf.nn.softmax_cross_entropy_with_logits(labels=target,
                                                        logits=output)
 
 
-def sparse_categorical_crossentropy(target, output, from_logits=False):
+def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
     """Categorical crossentropy with integer targets.
 
     # Arguments
@@ -3019,10 +3231,31 @@ def sparse_categorical_crossentropy(target, output, from_logits=False):
             case `output` is expected to be the logits).
         from_logits: Boolean, whether `output` is the
             result of a softmax, or is a tensor of logits.
+        axis: Int specifying the channels axis. `axis=-1`
+            corresponds to data format `channels_last`,
+            and `axis=1` corresponds to data format
+            `channels_first`.
 
     # Returns
         Output tensor.
+
+    # Raises
+        ValueError: if `axis` is neither -1 nor one of
+            the axes of `output`.
     """
+    output_dimensions = list(range(len(output.get_shape())))
+    if axis != -1 and axis not in output_dimensions:
+        raise ValueError(
+            '{}{}{}'.format(
+                'Unexpected channels axis {}. '.format(axis),
+                'Expected to be -1 or one of the axes of `output`, ',
+                'which has {} dimensions.'.format(len(output.get_shape()))))
+    # If the channels are not in the last axis, move them to be there:
+    if axis != -1 and axis != output_dimensions[-1]:
+        permutation = output_dimensions[:axis] + output_dimensions[axis + 1:]
+        permutation += [axis]
+        output = tf.transpose(output, perm=permutation)
+
     # Note: tf.nn.sparse_softmax_cross_entropy_with_logits
     # expects logits, Keras expects probabilities.
     if not from_logits:
@@ -3145,7 +3378,7 @@ def l2_normalize(x, axis=None):
     # Returns
         A tensor.
     """
-    return tf.nn.l2_normalize(x, dim=axis)
+    return tf.nn.l2_normalize(x, axis=axis)
 
 
 def in_top_k(predictions, targets, k):
@@ -3179,12 +3412,12 @@ def _preprocess_conv1d_input(x, data_format):
     """
     if dtype(x) == 'float64':
         x = tf.cast(x, 'float32')
-    tf_data_format = 'NHWC'  # to pass TF Conv2dNative operations
+    tf_data_format = 'NWC'  # to pass TF Conv2dNative operations
     if data_format == 'channels_first':
         if not _has_nchw_support():
             x = tf.transpose(x, (0, 2, 1))  # NCW -> NWC
         else:
-            tf_data_format = 'NCHW'
+            tf_data_format = 'NCW'
     return x, tf_data_format
 
 
@@ -3267,24 +3500,23 @@ def conv1d(x, kernel, strides=1, padding='valid',
         A tensor, result of 1D convolution.
 
     # Raises
-        ValueError: if `data_format` is neither `channels_last` or `channels_first`.
+        ValueError: If `data_format` is neither
+            `"channels_last"` nor `"channels_first"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     kernel_shape = kernel.get_shape().as_list()
     if padding == 'causal':
+        if data_format != 'channels_last':
+            raise ValueError('When using causal padding in `conv1d`, '
+                             '`data_format` must be "channels_last" '
+                             '(temporal data).')
         # causal (dilated) convolution:
         left_pad = dilation_rate * (kernel_shape[0] - 1)
         x = temporal_padding(x, (left_pad, 0))
         padding = 'valid'
     padding = _preprocess_padding(padding)
-    if data_format == 'channels_last':
-        tf_data_format = 'NWC'
-    else:
-        tf_data_format = 'NCW'
+    x, tf_data_format = _preprocess_conv1d_input(x, data_format)
     x = tf.nn.convolution(
         input=x,
         filter=kernel,
@@ -3292,6 +3524,9 @@ def conv1d(x, kernel, strides=1, padding='valid',
         strides=(strides,),
         padding=padding,
         data_format=tf_data_format)
+
+    if data_format == 'channels_first' and tf_data_format == 'NWC':
+        x = tf.transpose(x, (0, 2, 1))  # NWC -> NCW
     return x
 
 
@@ -3313,12 +3548,10 @@ def conv2d(x, kernel, strides=(1, 1), padding='valid',
         A tensor, result of 2D convolution.
 
     # Raises
-        ValueError: if `data_format` is neither `channels_last` or `channels_first`.
+        ValueError: If `data_format` is neither
+            `"channels_last"` nor `"channels_first"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     x, tf_data_format = _preprocess_conv2d_input(x, data_format)
 
@@ -3354,12 +3587,10 @@ def conv2d_transpose(x, kernel, output_shape, strides=(1, 1),
         A tensor, result of transposed 2D convolution.
 
     # Raises
-        ValueError: if `data_format` is neither `channels_last` or `channels_first`.
+        ValueError: If `data_format` is neither
+            `"channels_last"` nor `"channels_first"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
     if isinstance(output_shape, (tuple, list)):
         output_shape = tf.stack(output_shape)
 
@@ -3405,21 +3636,27 @@ def separable_conv1d(x, depthwise_kernel, pointwise_kernel, strides=1,
         Output tensor.
 
     # Raises
-        ValueError: if `data_format` is neither `channels_last` or `channels_first`.
+        ValueError: If `data_format` is neither
+            `"channels_last"` nor `"channels_first"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
+    if isinstance(strides, int):
+        strides = (strides,)
+    if isinstance(dilation_rate, int):
+        dilation_rate = (dilation_rate,)
 
     x, tf_data_format = _preprocess_conv1d_input(x, data_format)
+    if tf_data_format == 'NWC':
+        tf_data_format = 'NHWC'
+    else:
+        tf_data_format = 'NCHW'
     padding = _preprocess_padding(padding)
     if tf_data_format == 'NHWC':
         spatial_start_dim = 1
-        strides = (1, 1) + strides + (1,)
+        strides = (1,) + strides * 2 + (1,)
     else:
         spatial_start_dim = 2
-        strides = (1, 1, 1) + strides
+        strides = (1, 1) + strides * 2
     x = tf.expand_dims(x, spatial_start_dim)
     depthwise_kernel = tf.expand_dims(depthwise_kernel, 0)
     pointwise_kernel = tf.expand_dims(pointwise_kernel, 0)
@@ -3457,12 +3694,10 @@ def separable_conv2d(x, depthwise_kernel, pointwise_kernel, strides=(1, 1),
         Output tensor.
 
     # Raises
-        ValueError: if `data_format` is neither `channels_last` or `channels_first`.
+        ValueError: If `data_format` is neither
+            `"channels_last"` nor `"channels_first"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     x, tf_data_format = _preprocess_conv2d_input(x, data_format)
     padding = _preprocess_padding(padding)
@@ -3498,12 +3733,10 @@ def depthwise_conv2d(x, depthwise_kernel, strides=(1, 1), padding='valid',
         Output tensor.
 
     # Raises
-        ValueError: if `data_format` is neither `channels_last` or `channels_first`.
+        ValueError: If `data_format` is neither
+            `"channels_last"` nor `"channels_first"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     x, tf_data_format = _preprocess_conv2d_input(x, data_format)
     padding = _preprocess_padding(padding)
@@ -3540,12 +3773,10 @@ def conv3d(x, kernel, strides=(1, 1, 1), padding='valid',
         A tensor, result of 3D convolution.
 
     # Raises
-        ValueError: if `data_format` is neither `channels_last` or `channels_first`.
+        ValueError: If `data_format` is neither
+            `"channels_last"` nor `"channels_first"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     x, tf_data_format = _preprocess_conv3d_input(x, data_format)
     padding = _preprocess_padding(padding)
@@ -3579,12 +3810,10 @@ def conv3d_transpose(x, kernel, output_shape, strides=(1, 1, 1),
         A tensor, result of transposed 3D convolution.
 
     # Raises
-        ValueError: if `data_format` is neither `channels_last` or `channels_first`.
+        ValueError: If `data_format` is neither
+            `"channels_last"` nor `"channels_first"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
     if isinstance(output_shape, (tuple, list)):
         output_shape = tf.stack(output_shape)
 
@@ -3634,10 +3863,7 @@ def pool2d(x, pool_size, strides=(1, 1),
         ValueError: if `data_format` is neither `"channels_last"` or `"channels_first"`.
         ValueError: if `pool_mode` is neither `"max"` or `"avg"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     x, tf_data_format = _preprocess_conv2d_input(x, data_format)
     padding = _preprocess_padding(padding)
@@ -3683,10 +3909,7 @@ def pool3d(x, pool_size, strides=(1, 1, 1), padding='valid',
         ValueError: if `data_format` is neither `"channels_last"` or `"channels_first"`.
         ValueError: if `pool_mode` is neither `"max"` or `"avg"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     x, tf_data_format = _preprocess_conv3d_input(x, data_format)
     padding = _preprocess_padding(padding)
@@ -3731,10 +3954,7 @@ def bias_add(x, bias, data_format=None):
                        the bias should be either a vector or
                        a tensor with ndim(x) - 1 dimension
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
     bias_shape = int_shape(bias)
     if len(bias_shape) != 1 and len(bias_shape) != ndim(x) - 1:
         raise ValueError('Unexpected bias dimensions %d, expect to be 1 or %d dimensions'
@@ -3936,8 +4156,8 @@ def ctc_batch_cost(y_true, y_pred, input_length, label_length):
         Tensor with shape (samples,1) containing the
             CTC loss of each element.
     """
-    label_length = tf.to_int32(tf.squeeze(label_length))
-    input_length = tf.to_int32(tf.squeeze(input_length))
+    label_length = tf.to_int32(tf.squeeze(label_length, axis=-1))
+    input_length = tf.to_int32(tf.squeeze(input_length, axis=-1))
     sparse_labels = tf.to_int32(ctc_label_dense_to_sparse(y_true, label_length))
 
     y_pred = tf.log(tf.transpose(y_pred, perm=[1, 0, 2]) + epsilon())
@@ -4060,12 +4280,10 @@ def local_conv1d(inputs, kernel, kernel_size, strides, data_format=None):
         the tensor after 1d conv with un-shared weights, with shape (batch_size, output_length, filters)
 
     # Raises
-        ValueError: if `data_format` is neither `channels_last` or `channels_first`.
+        ValueError: If `data_format` is neither
+            `"channels_last"` nor `"channels_first"`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     stride = strides[0]
     kernel_shape = int_shape(kernel)
@@ -4073,8 +4291,8 @@ def local_conv1d(inputs, kernel, kernel_size, strides, data_format=None):
 
     xs = []
     for i in range(output_length):
-        slice_length = slice(i * stride,
-                             i * stride + kernel_size[0])
+        slice_length = py_slice(i * stride,
+                                i * stride + kernel_size[0])
         xs.append(reshape(inputs[:, slice_length, :],
                           (1, -1, feature_dim)))
     x_aggregate = concatenate(xs, axis=0)
@@ -4114,10 +4332,7 @@ def local_conv2d(inputs, kernel, kernel_size, strides, output_shape, data_format
         ValueError: if `data_format` is neither
                     `channels_last` or `channels_first`.
     """
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format: ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     stride_row, stride_col = strides
     output_row, output_col = output_shape
@@ -4127,10 +4342,10 @@ def local_conv2d(inputs, kernel, kernel_size, strides, output_shape, data_format
     xs = []
     for i in range(output_row):
         for j in range(output_col):
-            slice_row = slice(i * stride_row,
-                              i * stride_row + kernel_size[0])
-            slice_col = slice(j * stride_col,
-                              j * stride_col + kernel_size[1])
+            slice_row = py_slice(i * stride_row,
+                                 i * stride_row + kernel_size[0])
+            slice_col = py_slice(j * stride_col,
+                                 j * stride_col + kernel_size[1])
             if data_format == 'channels_first':
                 xs.append(reshape(inputs[:, :, slice_row, slice_col],
                                   (1, -1, feature_dim)))

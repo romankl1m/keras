@@ -4,7 +4,10 @@ from __future__ import print_function
 
 import cntk as C
 import numpy as np
-from .common import floatx, epsilon, image_dim_ordering, image_data_format
+from .common import floatx
+from .common import epsilon
+from .common import image_data_format
+from .common import normalize_data_format
 from collections import defaultdict
 from contextlib import contextmanager
 import warnings
@@ -13,6 +16,7 @@ import warnings
 C.set_global_option('align_axis', 1)
 
 b_any = any
+py_slice = slice
 
 
 dev = C.device.use_default_device()
@@ -24,7 +28,10 @@ if dev.type() == 0:
 
 # A learning phase is a bool tensor used to run Keras models in
 # either train mode (learning_phase == 1) or test mode (learning_phase == 0).
-_LEARNING_PHASE = C.constant(shape=(), dtype=np.float32, value=1.0, name='_keras_learning_phase')
+# LEARNING_PHASE_PLACEHOLDER is the placeholder for dynamic learning phase
+_LEARNING_PHASE_PLACEHOLDER = C.constant(shape=(), dtype=np.float32, value=1.0, name='_keras_learning_phase')
+# static learning phase flag, if it is not 0 or 1, we will go with dynamic learning phase tensor.
+_LEARNING_PHASE = -1
 _UID_PREFIXES = defaultdict(int)
 
 # cntk doesn't support gradient as symbolic op, to hook up with keras model,
@@ -49,8 +56,8 @@ def get_uid(prefix=''):
 
 
 def learning_phase():
-    # False = test, True = train
-    return _LEARNING_PHASE
+    # If _LEARNING_PHASE is not 0 or 1, return dynamic learning phase tensor
+    return _LEARNING_PHASE if _LEARNING_PHASE in {0, 1} else _LEARNING_PHASE_PLACEHOLDER
 
 
 def set_learning_phase(value):
@@ -59,8 +66,16 @@ def set_learning_phase(value):
         raise ValueError('CNTK Backend: Set learning phase '
                          'with value %s is not supported, '
                          'expected 0 or 1.' % value)
-    v = np.asarray(value)
-    _LEARNING_PHASE.value = v
+    _LEARNING_PHASE = value
+
+
+def clear_session():
+    """Reset learning phase flag for cntk backend.
+    """
+    global _LEARNING_PHASE
+    global _LEARNING_PHASE_PLACEHOLDER
+    _LEARNING_PHASE = -1
+    _LEARNING_PHASE_PLACEHOLDER.value = np.asarray(1.0)
 
 
 def in_train_phase(x, alt, training=None):
@@ -83,28 +98,26 @@ def in_train_phase(x, alt, training=None):
         x._uses_learning_phase = uses_learning_phase
         return x
     else:
-        result = C.element_select(training, x, alt)
+        # if _LEARNING_PHASE is static
+        if isinstance(training, int) or isinstance(training, bool):
+            result = x if training == 1 or training is True else alt
+        else:
+            result = C.element_select(training, x, alt)
         result._uses_learning_phase = uses_learning_phase
         return result
 
 
-def in_test_phase(x, alt):
-    global _LEARNING_PHASE
-    # Similar as in_train_phase, use element_select as workaround.
-    if callable(x) and isinstance(x, C.cntk_py.Function) is False:
-        x = x()
-    if callable(alt) and isinstance(alt, C.cntk_py.Function) is False:
-        alt = alt()
-
-    return C.element_select(learning_phase(), x, alt)
+def in_test_phase(x, alt, training=None):
+    return in_train_phase(alt, x, training=training)
 
 
 def _convert_string_dtype(dtype):
-    # cntk only support float32 and float64
     if dtype == 'float32':
         return np.float32
     elif dtype == 'float64':
         return np.float64
+    elif dtype == 'float16':
+        return np.float16
     else:
         # cntk only running with float,
         # try to cast to float to run the model
@@ -116,10 +129,12 @@ def _convert_dtype_string(dtype):
         return 'float32'
     elif dtype == np.float64:
         return 'float64'
+    elif dtype == np.float16:
+        return 'float16'
     else:
         raise ValueError('CNTK Backend: Unsupported dtype: %s. '
-                         'CNTK only supports float32 and '
-                         'float64.' % dtype)
+                         'CNTK only supports float32, float64, and '
+                         'float16.' % dtype)
 
 
 def variable(value, dtype=None, name=None, constraint=None):
@@ -156,9 +171,14 @@ def variable(value, dtype=None, name=None, constraint=None):
     shape = value.shape if hasattr(value, 'shape') else ()
     if hasattr(value, 'dtype') and value.dtype != dtype and len(shape) > 0:
         value = value.astype(dtype)
-    # cntk will init type based on the value type
+
+    # TODO: remove the conversion when cntk supports int32, int64
+    # https://docs.microsoft.com/en-us/python/api/cntk.variables.parameter
+    dtype = 'float32' if 'int' in str(dtype) else dtype
+
     v = C.parameter(shape=shape,
                     init=value,
+                    dtype=dtype,
                     name=_prepare_name(name, 'variable'))
     v._keras_shape = v.shape
     v._uses_learning_phase = False
@@ -167,10 +187,7 @@ def variable(value, dtype=None, name=None, constraint=None):
 
 
 def bias_add(x, bias, data_format=None):
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     dims = len(x.shape)
     if dims > 0 and x.shape[0] == C.InferredDimension:
@@ -253,7 +270,7 @@ def placeholder(
         raise ValueError('CNTK backend: creating placeholder with '
                          '%d dimension is not supported, at least '
                          '%d dimensions are needed.'
-                         % (len(cntk_shape, dynamic_axis_num)))
+                         % (len(cntk_shape), dynamic_axis_num))
 
     if name is None:
         name = ''
@@ -284,13 +301,18 @@ def is_placeholder(x):
 
 
 def is_keras_tensor(x):
-    if not isinstance(x, (C.variables.Constant,
-                          C.variables.Variable,
-                          C.variables.Parameter,
-                          C.ops.functions.Function)):
-        raise ValueError('Unexpectedly found an instance of type `' + str(type(x)) + '`. '
+    if not is_tensor(x):
+        raise ValueError('Unexpectedly found an instance of type `' +
+                         str(type(x)) + '`. '
                          'Expected a symbolic tensor instance.')
     return hasattr(x, '_keras_history')
+
+
+def is_tensor(x):
+    return isinstance(x, (C.variables.Constant,
+                          C.variables.Variable,
+                          C.variables.Parameter,
+                          C.ops.functions.Function))
 
 
 def shape(x):
@@ -347,27 +369,21 @@ def constant(value, dtype=None, shape=None, name=None):
 
 
 def random_binomial(shape, p=0.0, dtype=None, seed=None):
-    # use numpy workaround now
     if seed is None:
         # ensure that randomness is conditioned by the Numpy RNG
         seed = np.random.randint(10e7)
-        np.random.seed(seed)
     if dtype is None:
         dtype = np.float32
     else:
         dtype = _convert_string_dtype(dtype)
 
-    size = 1
     for _ in shape:
         if _ is None:
             raise ValueError('CNTK Backend: randomness op with '
                              'dynamic shape is not supported now. '
                              'Please provide fixed dimension '
                              'instead of `None`.')
-        size *= _
-
-    binomial = np.random.binomial(1, p, size).astype(dtype).reshape(shape)
-    return variable(value=binomial, dtype=dtype)
+    return C.random.bernoulli(shape=shape, dtype=dtype, mean=p, seed=seed)
 
 
 def random_uniform(shape, minval=0.0, maxval=1.0, dtype=None, seed=None):
@@ -378,7 +394,10 @@ def random_uniform(shape, minval=0.0, maxval=1.0, dtype=None, seed=None):
                              'Please provide fixed dimension '
                              'instead of `None`.')
 
-    return random_uniform_variable(shape, minval, maxval, dtype, seed)
+    if seed is None:
+        # ensure that randomness is conditioned by the Numpy RNG
+        seed = np.random.randint(10e3)
+    return C.random.uniform(shape=shape, dtype=dtype, low=minval, high=maxval, seed=seed)
 
 
 def random_uniform_variable(shape, low, high,
@@ -428,13 +447,14 @@ def random_normal_variable(
     if name is None:
         name = ''
 
-    return C.parameter(
+    p = C.parameter(
         shape=shape,
         init=C.initializer.normal(
             scale=scale,
             seed=seed),
         dtype=dtype,
         name=name)
+    return variable(value=p.value + mean)
 
 
 def random_normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
@@ -446,8 +466,10 @@ def random_normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
                              'dynamic shape is not supported now. '
                              'Please provide fixed dimension '
                              'instead of `None`.')
-    # how to apply mean and stddev
-    return random_normal_variable(shape=shape, mean=mean, scale=1.0, seed=seed)
+    if seed is None:
+        # ensure that randomness is conditioned by the Numpy RNG
+        seed = np.random.randint(10e3)
+    return C.random.normal(shape=shape, mean=mean, scale=stddev, seed=seed, dtype=dtype)
 
 
 def truncated_normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
@@ -532,9 +554,17 @@ def batch_dot(x, y, axes=None):
     if axes is None:
         # behaves like tf.batch_matmul as default
         axes = [len(x_shape) - 1, len(y_shape) - 2]
+    if b_any([isinstance(a, (list, tuple)) for a in axes]):
+        raise ValueError('Multiple target dimensions are not supported. ' +
+                         'Expected: None, int, (int, int), ' +
+                         'Provided: ' + str(axes))
 
     if len(x_shape) == 2 and len(y_shape) == 2:
-        return sum(x * y, axis=1, keepdims=True)
+        if axes[0] == axes[1]:
+            result = sum(x * y, axis=axes[0], keepdims=True)
+            return result if axes[0] == 1 else transpose(result)
+        else:
+            return sum(x * transpose(y), axis=axes[0], keepdims=True)
     else:
         if len(y_shape) == 2:
             y = expand_dims(y)
@@ -565,7 +595,7 @@ def transpose(x):
 def gather(reference, indices):
     # There is a bug in cntk gather op which may cause crash.
     # We have made a fix but not catched in CNTK 2.1 release.
-    # Will udpate with gather op in next release
+    # Will update with gather op in next release
     if _get_cntk_version() >= 2.2:
         return C.ops.gather(reference, indices)
     else:
@@ -1036,7 +1066,7 @@ def _moments(x, axes=None, shift=None, keep_dims=False):
     return mean, variance
 
 
-def batch_normalization(x, mean, var, beta, gamma, epsilon=1e-3):
+def batch_normalization(x, mean, var, beta, gamma, axis=-1, epsilon=1e-3):
     # The mean / var / beta / gamma may be processed by broadcast
     # so it may have an extra batch axis with 1, it is not needed
     # in cntk, need to remove those dummy axis.
@@ -1055,7 +1085,7 @@ def batch_normalization(x, mean, var, beta, gamma, epsilon=1e-3):
     elif ndim(beta) == ndim(x) and shape(beta)[0] == 1:
         beta = _reshape_dummy_dim(beta, [0])
 
-    return (x - mean) / (C.sqrt(var) + epsilon) * gamma + beta
+    return (x - mean) / C.sqrt(var + epsilon) * gamma + beta
 
 
 def concatenate(tensors, axis=-1):
@@ -1108,7 +1138,10 @@ def reshape(x, shape):
 def permute_dimensions(x, pattern):
     dims = len(int_shape(x))
     num_dynamic_axis = _get_dynamic_axis_num(x)
-    current_layout = tuple([i for i in range(dims)])
+    if isinstance(pattern, list):
+        current_layout = [i for i in range(dims)]
+    else:
+        current_layout = tuple([i for i in range(dims)])
 
     if num_dynamic_axis > 0 and pattern[:num_dynamic_axis] != current_layout[:num_dynamic_axis]:
         raise ValueError('CNTK backend: the permute pattern %s '
@@ -1348,31 +1381,37 @@ def rnn(step_function, inputs, initial_states,
                                   'variable-length sequences. Please specify a '
                                   'static length for your sequences.')
 
+    rnn_inputs = inputs
     if need_convert:
         if go_backwards:
-            inputs = reverse(inputs, 1)
+            rnn_inputs = reverse(rnn_inputs, 1)
 
-        inputs = C.to_sequence(inputs)
+        rnn_inputs = C.to_sequence(rnn_inputs)
 
-        j = 0
-        while j < len(constants):
-            if isinstance(constants[j], list):
-                i = 0
-                while i < len(constants[j]):
-                    if _get_dynamic_axis_num(constants[j][i]) == 1:
-                        constants[j][i] = C.sequence.broadcast_as(constants[j][i], inputs)
-                    i += 1
+        rnn_constants = []
+        for constant in constants:
+            if isinstance(constant, list):
+                new_c = []
+                for c in constant:
+                    if _get_dynamic_axis_num(c) == 1:
+                        new_c.append(C.sequence.broadcast_as(c, rnn_inputs))
+                    else:
+                        new_c.append(c)
+                rnn_constants.append(new_c)
             else:
-                if _get_dynamic_axis_num(constants[j]) == 1:
-                    constants[j] = C.sequence.broadcast_as(constants[j], inputs)
-            j += 1
+                if _get_dynamic_axis_num(constant) == 1:
+                    rnn_constants.append(C.sequence.broadcast_as(constant, rnn_inputs))
+                else:
+                    rnn_constants.append(constant)
+    else:
+        rnn_constants = constants
 
     if mask is not None and not has_seq_axis(mask):
         if go_backwards:
             mask = reverse(mask, 1)
         if len(int_shape(mask)) == 2:
             mask = expand_dims(mask)
-        mask = C.to_sequence_like(mask, inputs)
+        mask = C.to_sequence_like(mask, rnn_inputs)
 
     states = tuple(initial)
 
@@ -1384,7 +1423,7 @@ def rnn(step_function, inputs, initial_states,
             for s, p in zip(states, place_holders):
                 past_values.append(C.sequence.past_value(p, s))
             new_output, new_states = step_function(
-                x, tuple(past_values) + tuple(constants))
+                x, tuple(past_values) + tuple(rnn_constants))
 
             if getattr(new_output, '_uses_learning_phase', False):
                 global uses_learning_phase
@@ -1399,7 +1438,7 @@ def rnn(step_function, inputs, initial_states,
                 new_output = n_s[0]
             return new_output, n_s
 
-        final_output, final_states = _recurrence(inputs, states, mask)
+        final_output, final_states = _recurrence(rnn_inputs, states, mask)
         last_output = C.sequence.last(final_output)
         last_states = [C.sequence.last(s) for s in final_states]
 
@@ -1441,10 +1480,7 @@ def hard_sigmoid(x):
 
 def conv1d(x, kernel, strides=1, padding='valid',
            data_format=None, dilation_rate=1):
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     if padding == 'causal':
         # causal (dilated) convolution:
@@ -1473,10 +1509,7 @@ def conv1d(x, kernel, strides=1, padding='valid',
 
 def conv2d(x, kernel, strides=(1, 1), padding='valid',
            data_format=None, dilation_rate=(1, 1)):
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     x = _preprocess_conv2d_input(x, data_format)
     kernel = _preprocess_conv2d_kernel(kernel, data_format)
@@ -1507,25 +1540,120 @@ def conv2d(x, kernel, strides=(1, 1), padding='valid',
 
 def separable_conv1d(x, depthwise_kernel, pointwise_kernel, strides=1,
                      padding='valid', data_format=None, dilation_rate=1):
-    raise NotImplementedError
+    data_format = normalize_data_format(data_format)
+    if isinstance(strides, int):
+        strides = (strides,)
+    if isinstance(dilation_rate, int):
+        dilation_rate = (dilation_rate,)
+
+    if data_format == 'channels_last':
+        spatial_start_dim = 2
+    else:
+        spatial_start_dim = 3
+    x = expand_dims(x, spatial_start_dim)
+    depthwise_kernel = expand_dims(depthwise_kernel, 1)
+    pointwise_kernel = expand_dims(pointwise_kernel, 1)
+    strides = (1,) + strides + (1,)
+    dilation_rate = (1,) + dilation_rate
+
+    x = _preprocess_conv2d_input(x, data_format)
+    depthwise_kernel = _preprocess_conv2d_kernel(depthwise_kernel, data_format)
+    depthwise_kernel = C.reshape(C.transpose(depthwise_kernel, (1, 0, 2, 3)),
+                                 (-1, 1) + depthwise_kernel.shape[2:])
+    pointwise_kernel = _preprocess_conv2d_kernel(pointwise_kernel, data_format)
+    padding = _preprocess_border_mode(padding)
+
+    if dilation_rate == (1, 1):
+        x = C.convolution(depthwise_kernel, x,
+                          strides=strides,
+                          auto_padding=[False, padding, padding],
+                          groups=x.shape[0])
+        x = C.convolution(pointwise_kernel, x,
+                          strides=(1, 1, 1),
+                          auto_padding=[False])
+    else:
+        if dilation_rate[0] != dilation_rate[1]:
+            raise ValueError('CNTK Backend: non-square dilation_rate is '
+                             'not supported.')
+        if strides != (1, 1):
+            raise ValueError('Invalid strides for dilated convolution')
+        x = C.convolution(depthwise_kernel, x,
+                          strides=strides,
+                          auto_padding=[False, padding, padding],
+                          groups=x.shape[0])
+        x = C.convolution(pointwise_kernel, x,
+                          strides=(1, 1, 1),
+                          auto_padding=[False])
+    x = _postprocess_conv2d_output(x, data_format)
+    return squeeze(x, spatial_start_dim)
 
 
 def separable_conv2d(x, depthwise_kernel, pointwise_kernel, strides=(1, 1),
                      padding='valid', data_format=None, dilation_rate=(1, 1)):
-    raise NotImplementedError
+    data_format = normalize_data_format(data_format)
+
+    x = _preprocess_conv2d_input(x, data_format)
+    depthwise_kernel = _preprocess_conv2d_kernel(depthwise_kernel, data_format)
+    depthwise_kernel = C.reshape(C.transpose(depthwise_kernel, (1, 0, 2, 3)),
+                                 (-1, 1) + depthwise_kernel.shape[2:])
+    pointwise_kernel = _preprocess_conv2d_kernel(pointwise_kernel, data_format)
+    padding = _preprocess_border_mode(padding)
+
+    if dilation_rate == (1, 1):
+        strides = (1,) + strides
+        x = C.convolution(depthwise_kernel, x,
+                          strides=strides,
+                          auto_padding=[False, padding, padding],
+                          groups=x.shape[0])
+        x = C.convolution(pointwise_kernel, x,
+                          strides=(1, 1, 1),
+                          auto_padding=[False])
+    else:
+        if dilation_rate[0] != dilation_rate[1]:
+            raise ValueError('CNTK Backend: non-square dilation_rate is '
+                             'not supported.')
+        if strides != (1, 1):
+            raise ValueError('Invalid strides for dilated convolution')
+        x = C.convolution(depthwise_kernel, x,
+                          strides=dilation_rate[0],
+                          auto_padding=[False, padding, padding])
+        x = C.convolution(pointwise_kernel, x,
+                          strides=(1, 1, 1),
+                          auto_padding=[False])
+    return _postprocess_conv2d_output(x, data_format)
 
 
 def depthwise_conv2d(x, depthwise_kernel, strides=(1, 1), padding='valid',
                      data_format=None, dilation_rate=(1, 1)):
-    raise NotImplementedError
+    data_format = normalize_data_format(data_format)
+
+    x = _preprocess_conv2d_input(x, data_format)
+    depthwise_kernel = _preprocess_conv2d_kernel(depthwise_kernel, data_format)
+    depthwise_kernel = C.reshape(C.transpose(depthwise_kernel, (1, 0, 2, 3)),
+                                 (-1, 1) + depthwise_kernel.shape[2:])
+    padding = _preprocess_border_mode(padding)
+    if dilation_rate == (1, 1):
+        strides = (1,) + strides
+        x = C.convolution(depthwise_kernel, x,
+                          strides=strides,
+                          auto_padding=[False, padding, padding],
+                          groups=x.shape[0])
+    else:
+        if dilation_rate[0] != dilation_rate[1]:
+            raise ValueError('CNTK Backend: non-square dilation_rate is '
+                             'not supported.')
+        if strides != (1, 1):
+            raise ValueError('Invalid strides for dilated convolution')
+        x = C.convolution(depthwise_kernel, x,
+                          strides=dilation_rate[0],
+                          auto_padding=[False, padding, padding],
+                          groups=x.shape[0])
+    return _postprocess_conv2d_output(x, data_format)
 
 
 def conv3d(x, kernel, strides=(1, 1, 1), padding='valid',
            data_format=None, dilation_rate=(1, 1, 1)):
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     x = _preprocess_conv3d_input(x, data_format)
     kernel = _preprocess_conv3d_kernel(kernel, data_format)
@@ -1546,10 +1674,7 @@ def conv3d(x, kernel, strides=(1, 1, 1), padding='valid',
 
 def conv3d_transpose(x, kernel, output_shape, strides=(1, 1, 1),
                      padding='valid', data_format=None):
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     x = _preprocess_conv3d_input(x, data_format)
     kernel = _preprocess_conv3d_kernel(kernel, data_format)
@@ -1582,10 +1707,7 @@ def conv3d_transpose(x, kernel, output_shape, strides=(1, 1, 1),
 def pool2d(x, pool_size, strides=(1, 1),
            padding='valid', data_format=None,
            pool_mode='max'):
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     padding = _preprocess_border_mode(padding)
     strides = strides
@@ -1612,10 +1734,7 @@ def pool2d(x, pool_size, strides=(1, 1),
 
 def pool3d(x, pool_size, strides=(1, 1, 1), padding='valid',
            data_format=None, pool_mode='max'):
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     padding = _preprocess_border_mode(padding)
 
@@ -1668,8 +1787,8 @@ def batch_flatten(x):
     return x
 
 
-def softmax(x):
-    return C.softmax(x)
+def softmax(x, axis=-1):
+    return C.softmax(x, axis=axis)
 
 
 def softplus(x):
@@ -1680,7 +1799,23 @@ def softsign(x):
     return x / (1 + C.abs(x))
 
 
-def categorical_crossentropy(target, output, from_logits=False):
+def categorical_crossentropy(target, output, from_logits=False, axis=-1):
+    # Here, unlike other backends, the tensors lack a batch dimension:
+    axis_without_batch = -1 if axis == -1 else axis - 1
+    output_dimensions = list(range(len(output.shape)))
+    if axis_without_batch != -1 and axis_without_batch not in output_dimensions:
+        raise ValueError(
+            '{}{}{}'.format(
+                'Unexpected channels axis {}. '.format(axis_without_batch),
+                'Expected to be -1 or one of the axes of `output`, ',
+                'which has {} dimensions.'.format(len(output.shape))))
+    # If the channels are not in the last axis, move them to be there:
+    if axis_without_batch != -1 and axis_without_batch != output_dimensions[-1]:
+        permutation = output_dimensions[:axis_without_batch]
+        permutation += output_dimensions[axis_without_batch + 1:]
+        permutation += [axis_without_batch]
+        output = C.transpose(output, permutation)
+        target = C.transpose(target, permutation)
     if from_logits:
         result = C.cross_entropy_with_softmax(output, target)
         # cntk's result shape is (batch, 1), while keras expect (batch, )
@@ -1693,10 +1828,20 @@ def categorical_crossentropy(target, output, from_logits=False):
         return -sum(target * C.log(output), axis=-1)
 
 
-def sparse_categorical_crossentropy(target, output, from_logits=False):
-    target = C.one_hot(target, output.shape[-1])
+def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
+    # Here, unlike other backends, the tensors lack a batch dimension:
+    axis_without_batch = -1 if axis == -1 else axis - 1
+    output_dimensions = list(range(len(output.shape)))
+    if axis_without_batch != -1 and axis_without_batch not in output_dimensions:
+        raise ValueError(
+            '{}{}{}'.format(
+                'Unexpected channels axis {}. '.format(axis_without_batch),
+                'Expected to be -1 or one of the axes of `output`, ',
+                'which has {} dimensions.'.format(len(output.shape))))
+    target = C.one_hot(target, output.shape[axis_without_batch],
+                       axis=axis_without_batch)
     target = C.reshape(target, output.shape)
-    return categorical_crossentropy(target, output, from_logits)
+    return categorical_crossentropy(target, output, from_logits, axis=axis)
 
 
 class Function(object):
@@ -1784,6 +1929,7 @@ class Function(object):
         return True
 
     def __call__(self, inputs):
+        global _LEARNING_PHASE_PLACEHOLDER
         global _LEARNING_PHASE
         assert isinstance(inputs, (list, tuple))
         feed_dict = {}
@@ -1794,8 +1940,8 @@ class Function(object):
                value.dtype != np.float64):
                 value = value.astype(np.float32)
 
-            if tensor == _LEARNING_PHASE:
-                _LEARNING_PHASE.value = np.asarray(value)
+            if tensor == _LEARNING_PHASE_PLACEHOLDER:
+                _LEARNING_PHASE_PLACEHOLDER.value = np.asarray(value)
             else:
                 # in current version cntk can't support input with variable
                 # length. Will support it in next release.
@@ -1841,7 +1987,8 @@ class Function(object):
             # "forward" method to let cntk know we want to evaluate them.from
             # But the assign ops won't be executed under this mode, that's why
             # we need this check.
-            if self.unrelated_updates is None and _LEARNING_PHASE.value == 1.0:
+            if (self.unrelated_updates is None and
+                    (_LEARNING_PHASE_PLACEHOLDER.value == 1.0 or _LEARNING_PHASE == 1)):
                 _, output_values = self.metrics_func.forward(
                     input_dict,
                     self.metrics_func.outputs,
@@ -1880,23 +2027,11 @@ def function(inputs, outputs, updates=[], **kwargs):
 def temporal_padding(x, padding=(1, 1)):
     assert len(padding) == 2
     num_dynamic_axis = _get_dynamic_axis_num(x)
-    base_shape = x.shape
-    if num_dynamic_axis > 0:
-        assert len(base_shape) == 2
-        if hasattr(C, 'pad'):
-            x = C.pad(x, pattern=[padding, (0, 0)])
-        else:
-            x = _padding(x, padding, 0)
-    else:
-        assert len(base_shape) == 3
-        if hasattr(C, 'pad'):
-            x = C.pad(x, pattern=[(0, 0), padding, (0, 0)])
-        else:
-            x = _padding(x, padding, 1)
-    return x
+    assert len(x.shape) == 3 - (1 if num_dynamic_axis > 0 else 0)
+    return pad(x, [padding], 'channels_last', num_dynamic_axis)
 
 
-def _padding(x, pattern, axis):
+def _padding(x, pattern, axis):  # pragma: no cover
     base_shape = x.shape
     if b_any([dim < 0 for dim in base_shape]):
         raise ValueError('CNTK Backend: padding input tensor with '
@@ -1917,48 +2052,33 @@ def _padding(x, pattern, axis):
     return x
 
 
+def pad(x, pad_info, data_format, num_dynamic_axis):
+    if hasattr(C, 'pad'):
+        pattern = [list(p) for p in pad_info]
+        if data_format == 'channels_first':
+            pattern = [[0, 0]] + pattern
+        else:
+            pattern = pattern + [[0, 0]]
+        if num_dynamic_axis == 0:
+            pattern = [[0, 0]] + pattern
+        return C.pad(x, pattern=pattern)
+    else:  # pragma: no cover
+        for (a, p) in enumerate(pad_info):
+            x = _padding(x, p,
+                         a + (1 if num_dynamic_axis == 0 else 0) +
+                         (1 if data_format == 'channels_first' else 0))
+        return x
+
+
 def spatial_2d_padding(x, padding=((1, 1), (1, 1)), data_format=None):
     assert len(padding) == 2
     assert len(padding[0]) == 2
     assert len(padding[1]) == 2
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     num_dynamic_axis = _get_dynamic_axis_num(x)
-    base_shape = x.shape
-    if data_format == 'channels_first':
-        if num_dynamic_axis > 0:
-            assert len(base_shape) == 3
-            if hasattr(C, 'pad'):
-                x = C.pad(x, pattern=[[0, 0], list(padding[0]), list(padding[1])])
-            else:
-                x = _padding(x, padding[0], 1)
-                x = _padding(x, padding[1], 2)
-        else:
-            assert len(base_shape) == 4
-            if hasattr(C, 'pad'):
-                x = C.pad(x, pattern=[[0, 0], [0, 0], list(padding[0]), list(padding[1])])
-            else:
-                x = _padding(x, padding[0], 2)
-                x = _padding(x, padding[1], 3)
-    else:
-        if num_dynamic_axis > 0:
-            assert len(base_shape) == 3
-            if hasattr(C, 'pad'):
-                x = C.pad(x, pattern=[list(padding[0]), list(padding[1]), [0, 0]])
-            else:
-                x = _padding(x, padding[0], 0)
-                x = _padding(x, padding[1], 1)
-        else:
-            assert len(base_shape) == 4
-            if hasattr(C, 'pad'):
-                x = C.pad(x, pattern=[[0, 0], list(padding[0]), list(padding[1]), [0, 0]])
-            else:
-                x = _padding(x, padding[0], 1)
-                x = _padding(x, padding[1], 2)
-    return x
+    assert len(x.shape) == 4 - (1 if num_dynamic_axis > 0 else 0)
+    return pad(x, padding, data_format, num_dynamic_axis)
 
 
 def spatial_3d_padding(x, padding=((1, 1), (1, 1), (1, 1)), data_format=None):
@@ -1966,48 +2086,11 @@ def spatial_3d_padding(x, padding=((1, 1), (1, 1), (1, 1)), data_format=None):
     assert len(padding[0]) == 2
     assert len(padding[1]) == 2
     assert len(padding[2]) == 2
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     num_dynamic_axis = _get_dynamic_axis_num(x)
-    base_shape = x.shape
-    if data_format == 'channels_first':
-        if num_dynamic_axis > 0:
-            assert len(base_shape) == 4
-            if hasattr(C, 'pad'):
-                x = C.pad(x, pattern=[[0, 0], list(padding[0]), list(padding[1]), list(padding[2])])
-            else:
-                x = _padding(x, padding[0], 1)
-                x = _padding(x, padding[1], 2)
-                x = _padding(x, padding[2], 3)
-        else:
-            assert len(base_shape) == 5
-            if hasattr(C, 'pad'):
-                x = C.pad(x, pattern=[[0, 0], [0, 0], list(padding[0]), list(padding[1]), list(padding[2])])
-            else:
-                x = _padding(x, padding[0], 2)
-                x = _padding(x, padding[1], 3)
-                x = _padding(x, padding[2], 4)
-    else:
-        if num_dynamic_axis > 0:
-            assert len(base_shape) == 4
-            if hasattr(C, 'pad'):
-                x = C.pad(x, pattern=[list(padding[0]), list(padding[1]), list(padding[2]), [0, 0]])
-            else:
-                x = _padding(x, padding[0], 0)
-                x = _padding(x, padding[1], 1)
-                x = _padding(x, padding[2], 2)
-        else:
-            assert len(base_shape) == 5
-            if hasattr(C, 'pad'):
-                x = C.pad(x, pattern=[[0, 0], list(padding[0]), list(padding[1]), list(padding[2]), [0, 0]])
-            else:
-                x = _padding(x, padding[0], 1)
-                x = _padding(x, padding[1], 2)
-                x = _padding(x, padding[2], 3)
-    return x
+    assert len(x.shape) == 5 - (1 if num_dynamic_axis > 0 else 0)
+    return pad(x, padding, data_format, num_dynamic_axis)
 
 
 def one_hot(indices, num_classes):
@@ -2039,8 +2122,8 @@ def batch_get_value(xs):
 def set_value(x, value):
     if (isinstance(x, C.variables.Parameter) or
        isinstance(x, C.variables.Constant)):
-        if isinstance(value, float):
-            value = np.full(x.shape, value)
+        if isinstance(value, (float, int)):
+            value = np.full(x.shape, value, dtype=floatx())
         x.value = value
     else:
         raise NotImplementedError
@@ -2079,8 +2162,8 @@ def switch(condition, then_expression, else_expression):
         raise ValueError('Rank of condition should be less'
                          ' than or equal to rank of then and'
                          ' else expressions. ndim(condition)=' +
-                         str(cond_ndim) + ', ndim(then_expression)'
-                         '=' + str(expr_ndim))
+                         str(ndim_cond) + ', ndim(then_expression)'
+                         '=' + str(ndim_expr))
     elif ndim_cond < ndim_expr:
         shape_expr = int_shape(then_expression)
         ndim_diff = ndim_expr - ndim_cond
@@ -2108,10 +2191,7 @@ def in_top_k(predictions, targets, k):
 
 def conv2d_transpose(x, kernel, output_shape, strides=(1, 1),
                      padding='valid', data_format=None):
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     x = _preprocess_conv2d_input(x, data_format)
     kernel = _preprocess_conv2d_kernel(kernel, data_format)
@@ -2241,10 +2321,7 @@ def _reshape_sequence(x, time_step):
 
 
 def local_conv1d(inputs, kernel, kernel_size, strides, data_format=None):
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     stride = strides[0]
     kernel_shape = int_shape(kernel)
@@ -2252,8 +2329,8 @@ def local_conv1d(inputs, kernel, kernel_size, strides, data_format=None):
 
     xs = []
     for i in range(output_length):
-        slice_length = slice(i * stride,
-                             i * stride + kernel_size[0])
+        slice_length = py_slice(i * stride,
+                                i * stride + kernel_size[0])
         xs.append(reshape(inputs[:, slice_length, :],
                           (-1, 1, feature_dim)))
     x_aggregate = concatenate(xs, axis=1)
@@ -2273,10 +2350,7 @@ def local_conv2d(inputs,
                  strides,
                  output_shape,
                  data_format=None):
-    if data_format is None:
-        data_format = image_data_format()
-    if data_format not in {'channels_first', 'channels_last'}:
-        raise ValueError('Unknown data_format ' + str(data_format))
+    data_format = normalize_data_format(data_format)
 
     stride_row, stride_col = strides
     output_row, output_col = output_shape
@@ -2286,10 +2360,10 @@ def local_conv2d(inputs,
 
     for i in range(output_row):
         for j in range(output_col):
-            slice_row = slice(i * stride_row,
-                              i * stride_row + kernel_size[0])
-            slice_col = slice(j * stride_col,
-                              j * stride_col + kernel_size[1])
+            slice_row = py_slice(i * stride_row,
+                                 i * stride_row + kernel_size[0])
+            slice_col = py_slice(j * stride_col,
+                                 j * stride_col + kernel_size[1])
             if data_format == 'channels_first':
                 xs.append(reshape(inputs[:, :, slice_row, slice_col],
                                   (-1, 1, feature_dim)))
@@ -2322,6 +2396,10 @@ def reverse(x, axes):
     end_index = [0 for _ in cntk_axes]
     strides = [-1 for _ in cntk_axes]
     return C.slice(x, cntk_axes, begin_index, end_index, strides)
+
+
+def slice(x, start, size):
+    raise NotImplementedError
 
 
 def _reshape_batch(x, shape):
